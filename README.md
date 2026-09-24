@@ -33,7 +33,20 @@ uv run audiobook_maker.py make book.txt --dry-run
 ```
 
 Flags: `--voice af_heart` (any Kokoro voice id), `--speed 1.0`, `--group 25`, `--limit N`,
-`--title "Book Title"`, `--log-file progress.log`.
+`--title "Book Title"`, `--log-file progress.log`. `make` also takes `--chapters 1210-1261` (a
+range of the file), `--split 10,10,10,10,12` (explicit chapters per M4B) and `--merge-tail`
+(fold a short last group into the one before it).
+
+## Background jobs
+
+`audiobook.sh` runs one job detached and reports it in one line, with a macOS notification at
+the end:
+
+```bash
+./audiobook.sh start 1210-1261 --group 10 --merge-tail   # finds the archived file for the range
+./audiobook.sh status                                    # RUNNING 31/52 chapters, 3/5 files, ETA ~14m
+./audiobook.sh wait                                      # blocks; DONE / FAILED, exit code to match
+```
 
 Every chapter is synthesized once into `<out-dir>/.cache/<hash>.wav`, keyed by model, voice,
 speed, pipeline version and text. Re-runs only synthesize what changed and re-assemble the M4B

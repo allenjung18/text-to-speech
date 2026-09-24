@@ -11,7 +11,8 @@ ShadowSlave download script writes.
 
 Every chapter is synthesized once and cached by a hash of (model, voice, speed,
 pipeline version, text). Re-runs only synthesize what changed, then re-assemble
-the M4B files (one per --group chapters, default 25) with chapter markers.
+the M4B files (one per --group chapters, default 25, or --split sizes) with
+chapter markers. --chapters N-M selects a range of one file.
 """
 from __future__ import annotations
 
@@ -213,13 +214,62 @@ def build_m4b(items: list[tuple[Chapter, Path]], out: Path, book: str, work_dir:
     return out
 
 
-def group_chapters(chapters: list[Chapter], group: int) -> list[list[Chapter]]:
+def group_chapters(chapters: list[Chapter], group: int, split: list[int] | None = None,
+                   merge_tail: bool = False) -> list[list[Chapter]]:
+    """Consecutive runs of `group` chapters. `split` gives explicit sizes instead (they must add up
+    to the chapter count); `merge_tail` folds a short last group into the one before it."""
     chapters = sorted(chapters, key=lambda c: c.number)
+    if split:
+        if sum(split) != len(chapters):
+            raise SystemExit(f"--split {','.join(map(str, split))} adds up to {sum(split)}, "
+                             f"but {len(chapters)} chapters are selected")
+        out, i = [], 0
+        for n in split:
+            out.append(chapters[i:i + n])
+            i += n
+        return out
     first = chapters[0].number
     groups: dict[int, list[Chapter]] = {}
     for ch in chapters:
         groups.setdefault((ch.number - first) // group, []).append(ch)
-    return [groups[k] for k in sorted(groups)]
+    out = [groups[k] for k in sorted(groups)]
+    if merge_tail and len(out) > 1 and len(out[-1]) < group:
+        tail = out.pop()  # pop first: `out[-2] += out.pop()` stores into the shifted slot
+        out[-1] = out[-1] + tail
+    return out
+
+
+def parse_range(s: str) -> tuple[int, int]:
+    m = re.fullmatch(r"(\d+)(?:-(\d+))?", s.strip())
+    if not m:
+        raise argparse.ArgumentTypeError(f"expected N or N-M, got {s!r}")
+    lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+    if hi < lo:
+        raise argparse.ArgumentTypeError(f"range {s!r} runs backwards")
+    return lo, hi
+
+
+def parse_split(s: str) -> list[int]:
+    try:
+        sizes = [int(x) for x in s.split(",")]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected sizes like 10,10,12, got {s!r}")
+    if any(n < 1 for n in sizes):
+        raise argparse.ArgumentTypeError("every --split size must be at least 1")
+    return sizes
+
+
+def seconds_per_word(cache_dir: Path) -> float:
+    """Measured synthesis cost from the cache's own metadata; a first-run guess when it is empty."""
+    words = secs = 0.0
+    for meta in cache_dir.glob("*.json"):
+        try:
+            info = json.loads(meta.read_text())
+            words += info["words"]
+            secs += info["generate_seconds"]
+        except (ValueError, KeyError):
+            continue
+    return secs / words if words else 0.045
 
 
 # ----------------------------------------------------------------------------- commands
@@ -231,22 +281,35 @@ def fmt(seconds: float) -> str:
 
 
 def make(txt: Path, out_dir: Path, voice: str, speed: float, group: int, limit: int | None,
-         title: str | None, dry_run: bool, log) -> list[Path]:
+         title: str | None, dry_run: bool, log, chapters_range: tuple[int, int] | None = None,
+         split: list[int] | None = None, merge_tail: bool = False) -> list[Path]:
     txt = txt.resolve()
     chapters = parse_chapters(txt)
+    if chapters_range:
+        lo, hi = chapters_range
+        chapters = [c for c in chapters if lo <= c.number <= hi]
+        missing = sorted(set(range(lo, hi + 1)) - {c.number for c in chapters})
+        if missing:
+            raise SystemExit(f"{txt.name} has no chapter(s) {missing[:10]} in {lo}-{hi}")
     if limit:
         chapters = chapters[:limit]
     book = title or book_title_from(txt)
     total_words = sum(c.words for c in chapters)
+    groups = group_chapters(chapters, group, split, merge_tail)
     log(f"{txt.name}: {len(chapters)} chapters, {total_words} words, book '{book}', "
-        f"{len(group_chapters(chapters, group))} file(s) of up to {group} chapters")
+        f"{len(groups)} file(s): " + ", ".join(f"{g[0].number}-{g[-1].number}" for g in groups))
+
+    cache_dir = out_dir / ".cache"
+    new = [c for c in chapters if not (cache_dir / f"{cache_key(c, voice, speed)}.wav").exists()]
+    est = sum(c.words for c in new) * seconds_per_word(cache_dir)
+    log(f"plan: {len(chapters)} chapters ({len(new)} new, {len(chapters) - len(new)} cached), "
+        f"{len(groups)} file(s), est ~{fmt(est)}")
     if dry_run:
         for c in chapters:
             log(f"  ch {c.number:>5}  {c.words:>5} words  {len(c.paragraphs):>3} paras  {c.subtitle}")
         return []
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir = out_dir / ".cache"
     cache_dir.mkdir(exist_ok=True)
     synth_holder: dict[str, Synth] = {}
 
@@ -256,7 +319,7 @@ def make(txt: Path, out_dir: Path, voice: str, speed: float, group: int, limit: 
         return synth_holder["s"]
 
     outputs: list[Path] = []
-    for grp in group_chapters(chapters, group):
+    for grp in groups:
         first, last = grp[0].number, grp[-1].number
         out = out_dir / f"{book} - Ch {first}-{last}.m4b"
         items = [(c, ensure_chapter_audio(c, cache_dir, synth_factory, voice, speed, log)) for c in grp]
@@ -294,6 +357,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--voice", default="af_heart", help="Kokoro voice id (default af_heart)")
         p.add_argument("--speed", type=float, default=1.0)
         p.add_argument("--group", type=int, default=25, help="chapters per M4B (default 25)")
+        p.add_argument("--merge-tail", action="store_true",
+                       help="fold a short last group into the one before it (52 by 10 -> 10,10,10,10,12)")
         p.add_argument("--limit", type=int, help="only the first N chapters (for testing)")
         p.add_argument("--title", help="book title (default derived from the filename)")
         p.add_argument("--dry-run", action="store_true", help="parse and list chapters, no audio")
@@ -302,6 +367,8 @@ def main(argv: list[str] | None = None) -> int:
     pm = sub.add_parser("make", help="one text file -> M4B files")
     pm.add_argument("txt", type=Path)
     pm.add_argument("--out-dir", type=Path, default=Path("audiobooks"))
+    pm.add_argument("--chapters", type=parse_range, help="only chapters N-M (inclusive)")
+    pm.add_argument("--split", type=parse_split, help="explicit chapters per file, e.g. 10,10,10,10,12")
     common(pm)
 
     pq = sub.add_parser("queue", help="every top-level PDF in a folder whose text is in archived/")
@@ -320,10 +387,10 @@ def main(argv: list[str] | None = None) -> int:
                 f.write(f"[{stamp}] {line}\n")
 
     kw = dict(voice=a.voice, speed=a.speed, group=a.group, limit=a.limit, title=a.title,
-              dry_run=a.dry_run, log=log)
+              dry_run=a.dry_run, log=log, merge_tail=a.merge_tail)
     t0 = time.time()
     if a.cmd == "make":
-        outs = make(a.txt, a.out_dir, **kw)
+        outs = make(a.txt, a.out_dir, chapters_range=a.chapters, split=a.split, **kw)
     else:
         outs = queue(a.folder, a.archived, a.out_dir, **kw)
     log(f"RESULT: {len(outs)} file(s) in {fmt(time.time() - t0)}")
