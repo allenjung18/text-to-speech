@@ -113,5 +113,8 @@ oov|check)
     extra=(); [ "$cmd" = check ] && extra=(--out-dir "$SS/audiobooks")
     cd "$REPO" && exec uv run audiobook_maker.py "$cmd" "$txt" --chapters "$range" ${extra[@]+"${extra[@]}"} "$@"
     ;;
-*) die "unknown command '$cmd' (start | status | wait | tail | oov | check)" ;;
+record)
+    cd "$REPO" && exec uv run python record.py "$@"
+    ;;
+*) die "unknown command '$cmd' (start | status | wait | tail | oov | check | record)" ;;
 esac
