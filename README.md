@@ -52,5 +52,27 @@ Every chapter is synthesized once into `<out-dir>/.cache/<hash>.wav`, keyed by m
 speed, pipeline version and text. Re-runs only synthesize what changed and re-assemble the M4B
 files, so new chapters or a fixed paragraph never regenerate the whole book.
 
+## Narration quality
+
+```bash
+uv run audiobook_maker.py oov book.txt --chapters 1462-1561     # words espeak has to guess: lexicon candidates
+uv run audiobook_maker.py check book.txt --chapters 1262-1271 --out-dir audiobooks   # Whisper round trip
+uv run audiobook_maker.py audition am_liam "am_liam:0.7,am_michael:0.3" --txt book.txt --chapter 1462
+uv run pytest                                                   # golden tests for the text rules
+```
+
+- **Lexicon.** `lexicon.json` beside the text file or one folder up (or `--lexicon`) maps a word to misaki
+  phonemes (`"Ananke": "/ənˈæŋki/"`) or a respelling (`"NQSC": "N Q S C"`). Whole words, case-sensitive,
+  possessives included. It changes the spoken text, so only chapters containing an entry are re-synthesized.
+- **check** transcribes cached chapters with mlx-whisper (large-v3-turbo, ~15 s per chapter), diffs them
+  against the source and writes `<out-dir>/check/ch-N.md` (timestamp, text says, Whisper heard), then
+  ranks the most-missed words. The chapter's proper nouns are given to Whisper as a prompt, so a name
+  spoken correctly is not flagged; homophones (Sunny / sonny) still are.
+- **Voices** are style vectors: `--voice am_liam:0.7,am_michael:0.3` renders with their weighted mean,
+  no training. `audition` renders one passage per voice plus `00-all-voices.m4a`.
+- **Text rules** (`textprep.normalize`): nbsp and zero-width characters, `--` and spaced ` - ` become em
+  dashes, and `[system messages]` lose their brackets. `tests/test_textprep.py` pins every rule and that an
+  empty lexicon leaves cache keys unchanged.
+
 Output is one `.m4b` per group with chapter markers, playable in Apple Books, BookPlayer,
 Prologue, and most audiobook apps.

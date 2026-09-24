@@ -5,6 +5,8 @@
 #   ./audiobook.sh status        # one line: RUNNING n/N chapters, f/F files, ETA | DONE | FAILED | IDLE
 #   ./audiobook.sh wait          # block until the job ends, print its result; exit 0 = DONE
 #   ./audiobook.sh tail [N]      # last N log lines (default 20), for when status says FAILED
+#   ./audiobook.sh oov 1462-1561     # words Kokoro guesses at: lexicon candidates (seconds)
+#   ./audiobook.sh check 1262-1271   # Whisper round trip on rendered chapters (~15 s each, foreground)
 #
 # start finds the archived text file that holds the whole range, refuses while another job is
 # running, and returns as soon as the job has printed its plan. Any further flags go to
@@ -102,5 +104,14 @@ wait)
     [[ "$line" == DONE* ]]
     ;;
 tail) tail -n "${1:-20}" "$LOG" 2>/dev/null || echo "IDLE: no job has run" ;;
-*) die "unknown command '$cmd' (start | status | wait | tail)" ;;
+oov|check)
+    [ $# -ge 1 ] || die "usage: $cmd N-M [flags...]"
+    range=$1; shift
+    [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]] || die "range must look like 1262-1271, got '$range'"
+    txt=$(find_txt "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}") || die "no file in $SS/archived covers $range"
+    [ "$cmd" = check ] && running && die "a render job is running; check shares the GPU with it — wait for it first"
+    extra=(); [ "$cmd" = check ] && extra=(--out-dir "$SS/audiobooks")
+    cd "$REPO" && exec uv run audiobook_maker.py "$cmd" "$txt" --chapters "$range" ${extra[@]+"${extra[@]}"} "$@"
+    ;;
+*) die "unknown command '$cmd' (start | status | wait | tail | oov | check)" ;;
 esac

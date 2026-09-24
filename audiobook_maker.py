@@ -23,11 +23,13 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+
+from textprep import Lexicon, normalize
 
 SAMPLE_RATE = 24000
 MODEL_ID = "mlx-community/Kokoro-82M-bf16"
@@ -46,11 +48,18 @@ PAUSE_END_OF_CHAPTER = 1.5
 class Chapter:
     number: int
     subtitle: str
-    paragraphs: list[str]
+    paragraphs: list[str]  # the book's text, normalized; what `check` compares the audio against
+    lexicon: Lexicon = field(default_factory=Lexicon, repr=False, compare=False)
 
     @property
     def spoken_title(self) -> str:
-        return f"Chapter {self.number}. {self.subtitle}" if self.subtitle else f"Chapter {self.number}"
+        t = f"Chapter {self.number}. {self.subtitle}" if self.subtitle else f"Chapter {self.number}"
+        return self.lexicon.apply(t)
+
+    @property
+    def spoken_paragraphs(self) -> list[str]:
+        """What the narrator is asked to say: the paragraphs with the book's lexicon applied."""
+        return [self.lexicon.apply(p) for p in self.paragraphs]
 
     @property
     def marker_title(self) -> str:
@@ -61,17 +70,13 @@ class Chapter:
         return sum(len(p.split()) for p in self.paragraphs)
 
     def cache_text(self) -> str:
-        return "\n".join([self.spoken_title, *self.paragraphs])
+        # With an empty lexicon this is byte-identical to pipeline version 1's key text, so a new
+        # lexicon entry (or text rule) re-synthesizes only the chapters whose spoken text it changes.
+        return "\n".join([self.spoken_title, *self.spoken_paragraphs])
 
 
-def normalize(s: str) -> str:
-    s = s.replace(" ", " ").replace("​", "").replace("﻿", "")
-    s = s.replace("--", "—")  # ASCII double dash -> em dash (Kokoro reads it as a pause)
-    s = re.sub(r"[ \t]+", " ", s)
-    return s.strip()
 
-
-def parse_chapters(path: Path) -> list[Chapter]:
+def parse_chapters(path: Path, lexicon: Lexicon | None = None) -> list[Chapter]:
     raw = path.read_text(encoding="utf-8")
     chapters: list[Chapter] = []
     for block in SEPARATOR.split(raw):
@@ -91,7 +96,7 @@ def parse_chapters(path: Path) -> list[Chapter]:
         # Title lines look like "<Book> Chapter N - Chapter N - N: Subtitle"; keep the subtitle.
         sm = re.search(r"\d+\s*:\s*(.+)$", title)
         subtitle = normalize(sm.group(1)) if sm else ""
-        chapters.append(Chapter(number, subtitle, paragraphs))
+        chapters.append(Chapter(number, subtitle, paragraphs, lexicon or Lexicon()))
     return chapters
 
 
@@ -103,14 +108,49 @@ def book_title_from(path: Path) -> str:
 
 # ----------------------------------------------------------------------------- synthesis
 
+def parse_voice(spec: str) -> list[tuple[str, float]]:
+    """"am_liam", or a weighted blend "am_liam:0.7,am_michael:0.3" (weights are normalized)."""
+    parts = []
+    for item in spec.split(","):
+        name, _, w = item.strip().partition(":")
+        if not re.fullmatch(r"[a-z]{2}_[a-z0-9]+", name):
+            raise SystemExit(f"voice {name!r} in {spec!r} is not a Kokoro voice id like am_liam")
+        try:
+            weight = float(w) if w else 1.0
+        except ValueError:
+            raise SystemExit(f"weight {w!r} in {spec!r} is not a number")
+        if weight <= 0:
+            raise SystemExit(f"weight for {name} in {spec!r} must be positive")
+        parts.append((name, weight))
+    return parts
+
+
 class Synth:
-    def __init__(self, voice: str, speed: float):
+    def __init__(self, voice: str, speed: float, blend_dir: Path = Path(".cache")):
         from mlx_audio.tts.utils import load_model  # heavy import, only when synthesizing
 
-        self.voice = voice
         self.speed = speed
         self.model = load_model(MODEL_ID)
         self.pipeline = self.model._get_pipeline("a")  # American English; created once
+        self.voice = self._resolve_voice(voice, blend_dir)
+
+    def _resolve_voice(self, spec: str, blend_dir: Path) -> str:
+        """A single voice id passes through. A blend is the weighted mean of the voice tensors
+        (voices are style vectors, so mixing needs no training), saved once as a .safetensors file
+        that the pipeline loads like any voice. Cache keys use the spec string, not the file."""
+        parts = parse_voice(spec)
+        if len(parts) == 1:
+            return parts[0][0]
+        import mlx.core as mx
+
+        total = sum(w for _, w in parts)
+        name = "+".join(f"{n}-{w / total:.3f}" for n, w in parts)
+        path = blend_dir / "voices" / f"{name}.safetensors"
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            mixed = sum(self.pipeline.load_single_voice(n) * (w / total) for n, w in parts)
+            mx.save_safetensors(str(path), {"voice": mixed})
+        return str(path)
 
     def say(self, text: str) -> np.ndarray:
         """Synthesize one paragraph. The pipeline may split it into several segments."""
@@ -128,7 +168,7 @@ class Synth:
 
     def chapter(self, ch: Chapter) -> np.ndarray:
         parts = [self.say(ch.spoken_title), silence(PAUSE_AFTER_TITLE)]
-        for i, p in enumerate(ch.paragraphs):
+        for i, p in enumerate(ch.spoken_paragraphs):
             if i:
                 parts.append(silence(PAUSE_BETWEEN_PARAGRAPHS))
             parts.append(self.say(p))
@@ -272,6 +312,197 @@ def seconds_per_word(cache_dir: Path) -> float:
     return secs / words if words else 0.045
 
 
+# ----------------------------------------------------------------------------- phase 2: find problems
+
+def select_chapters(txt: Path, chapters_range: tuple[int, int] | None, lexicon: Lexicon) -> list[Chapter]:
+    chapters = parse_chapters(txt.resolve(), lexicon)
+    if chapters_range:
+        lo, hi = chapters_range
+        chapters = [c for c in chapters if lo <= c.number <= hi]
+        if not chapters:
+            raise SystemExit(f"{txt.name} has no chapters in {lo}-{hi}")
+    return chapters
+
+
+def oov(txt: Path, chapters_range, lexicon_path: Path | None, top: int, log) -> list[tuple[str, int]]:
+    """Words misaki has no dictionary entry for, so espeak guesses them — the lexicon's candidates.
+    Measured by watching which words reach the fallback while phonemizing the real paragraphs."""
+    from misaki import en, espeak
+
+    lexicon = Lexicon.find(txt.resolve(), lexicon_path)
+    chapters = select_chapters(txt, chapters_range, lexicon)
+    g2p = en.G2P(trf=False, british=False, fallback=espeak.EspeakFallback(british=False), unk="")
+    inner, seen = g2p.fallback, {}
+
+    def spy(tk):
+        w = re.sub(r"['’]s$", "", tk.text.strip("…—-.,;:!?\"“”‘’()[]"))
+        if re.search(r"[A-Za-z]", w):
+            seen[w] = seen.get(w, 0) + 1
+        return inner(tk)
+
+    g2p.fallback = spy
+    for c in chapters:
+        for para in [c.spoken_title, *c.spoken_paragraphs]:
+            g2p(para)
+    ranked = sorted(seen.items(), key=lambda kv: -kv[1])
+    log(f"{len(chapters)} chapters: {len(ranked)} words go to the espeak fallback"
+        + (f" (lexicon {lexicon.source} already covers the rest)" if lexicon else ""))
+    log("paste the ones that sound wrong into lexicon.json and fix the phonemes (or use a respelling):")
+    g2p.fallback = inner
+    for w, n in ranked[:top]:
+        print(f'  "{w}": "/{g2p(w)[0]}/",   # {n}x')
+    return ranked
+
+
+def find_cached_wav(cache_dir: Path, number: int, voice: str | None) -> tuple[Path, dict] | None:
+    """Newest cached render of chapter `number` (in `voice`, when given)."""
+    best = None
+    for meta in cache_dir.glob("*.json"):
+        try:
+            info = json.loads(meta.read_text())
+        except ValueError:
+            continue
+        if info.get("number") != number or (voice and info.get("voice") != voice):
+            continue
+        wav = meta.with_suffix(".wav")
+        if wav.exists() and (best is None or wav.stat().st_mtime > best[0].stat().st_mtime):
+            best = (wav, info)
+    return best
+
+
+_NUM = re.compile(r"^\d+$")
+
+
+def words_for_diff(text: str) -> list[str]:
+    """Lower-case words with punctuation dropped; digits spelled out (Whisper writes "1262")."""
+    from num2words import num2words
+
+    out: list[str] = []
+    for w in re.split(r"[\s—–-]+", text.replace("’", "'")):
+        w = re.sub(r"[^\w']", "", w).strip("'").lower()
+        if not w:
+            continue
+        if _NUM.match(w):
+            out += re.split(r"[\s-]+", num2words(int(w)).replace(",", "").replace(" and ", " "))
+        else:
+            out.append(w)
+    return out
+
+
+def check(txt: Path, chapters_range, out_dir: Path, voice: str | None, model: str,
+          lexicon_path: Path | None, log) -> dict[str, int]:
+    """Whisper round trip: transcribe each cached chapter and diff it against the source text.
+    A word Whisper hears as something else is either mispronounced or a name Whisper cannot
+    spell; the report ranks them across chapters so the lexicon work starts from the worst."""
+    import difflib
+
+    import mlx_whisper
+
+    lexicon = Lexicon.find(txt.resolve(), lexicon_path)
+    chapters = select_chapters(txt, chapters_range, lexicon)
+    cache_dir, report_dir = out_dir / ".cache", out_dir / "check"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    suspects: dict[str, int] = {}
+    for c in chapters:
+        found = find_cached_wav(cache_dir, c.number, voice)
+        if not found:
+            log(f"ch {c.number:>5}  no cached audio{' in ' + voice if voice else ''}; skipped")
+            continue
+        wav, info = found
+        # Names in the prompt let Whisper spell them, so a correctly spoken name is not flagged.
+        names = sorted({w for p in c.paragraphs for w in re.findall(r"\b[A-Z][a-z]{3,}\b", p)})
+        prompt = ", ".join([*lexicon.entries, *names])[:800]
+        t0 = time.time()
+        res = mlx_whisper.transcribe(str(wav), path_or_hf_repo=model, word_timestamps=True,
+                                     initial_prompt=prompt, condition_on_previous_text=False)
+        heard = [(w["word"], w["start"]) for seg in res["segments"] for w in seg.get("words", [])]
+        hyp, hyp_t = [], []
+        for raw, start in heard:
+            for w in words_for_diff(raw):
+                hyp.append(w)
+                hyp_t.append(start)
+        src = words_for_diff("\n".join([f"Chapter {c.number}. {c.subtitle}", *c.paragraphs]))
+        sm = difflib.SequenceMatcher(None, src, hyp, autojunk=False)
+        issues, edits = [], 0
+        for op, i1, i2, j1, j2 in sm.get_opcodes():
+            if op == "equal":
+                continue
+            edits += max(i2 - i1, j2 - j1)
+            at = hyp_t[j1] if j1 < len(hyp_t) else (hyp_t[-1] if hyp_t else 0.0)
+            said, got = " ".join(src[i1:i2]), " ".join(hyp[j1:j2])
+            issues.append((at, op, said, got))
+            for w in src[i1:i2]:
+                suspects[w] = suspects.get(w, 0) + 1
+        wer = edits / max(1, len(src))
+        lines = [f"# Chapter {c.number} — Whisper round trip", "",
+                 f"voice {info.get('voice')}, {fmt(info.get('duration', 0))}, {len(src)} words, "
+                 f"{len(issues)} differences, word error rate {wer:.1%}", "",
+                 "| at | text says | Whisper heard |", "|---|---|---|"]
+        lines += [f"| {fmt(at)} | {said or '—'} | {got or '—'} |" for at, op, said, got in issues]
+        (report_dir / f"ch-{c.number}.md").write_text("\n".join(lines) + "\n")
+        log(f"ch {c.number:>5}  {len(src):>5} words  {len(issues):>3} diffs  WER {wer:5.1%}  "
+            f"{time.time() - t0:5.1f}s  -> check/ch-{c.number}.md")
+    ranked = sorted(suspects.items(), key=lambda kv: -kv[1])
+    common = {"the", "a", "and", "of", "to", "was", "he", "his", "that", "it", "in", "had", "as"}
+    top = [(w, n) for w, n in ranked if w not in common][:25]
+    if top:
+        log("most-missed source words (lexicon candidates): " + ", ".join(f"{w} {n}x" for w, n in top))
+    return suspects
+
+
+# ----------------------------------------------------------------------------- phase 2: voices
+
+def audition(voices: list[str], txt: Path | None, chapter: int | None, paragraphs: int, text: str | None,
+             out_dir: Path, speed: float, lexicon_path: Path | None, log) -> list[Path]:
+    """Render the same passage in each voice or blend: one m4a per voice plus one file of all of
+    them in order, each clip introduced by its number ("Voice two.") so the ear can match it up."""
+    from num2words import num2words
+
+    for v in voices:
+        parse_voice(v)
+    if text:
+        passage = [normalize(p) for p in re.split(r"\n\s*\n", text) if p.strip()]
+        lexicon = Lexicon.find(txt.resolve(), lexicon_path) if txt else Lexicon.load(lexicon_path)
+    else:
+        if not txt or chapter is None:
+            raise SystemExit("audition needs --text, or a text file with --chapter N")
+        lexicon = Lexicon.find(txt.resolve(), lexicon_path)
+        chs = select_chapters(txt, (chapter, chapter), lexicon)
+        passage = chs[0].paragraphs[:paragraphs]
+    passage = [lexicon.apply(p) for p in passage]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    work = out_dir / ".work"
+    work.mkdir(exist_ok=True)
+    synth: Synth | None = None
+    clips: list[Path] = []
+    for i, spec in enumerate(voices, 1):
+        if synth is None:
+            synth = Synth(spec, speed, work)
+        else:
+            synth.voice = synth._resolve_voice(spec, work)
+        parts = [synth.say(f"Voice {num2words(i)}."), silence(0.8)]
+        for j, p in enumerate(passage):
+            if j:
+                parts.append(silence(PAUSE_BETWEEN_PARAGRAPHS))
+            parts.append(synth.say(p))
+        parts.append(silence(1.2))
+        audio = np.concatenate(parts)
+        safe = re.sub(r"[^A-Za-z0-9_.+-]+", "_", spec.replace(":", "-").replace(",", "+"))
+        wav = work / f"{i:02d}-{safe}.wav"
+        sf.write(wav, audio, SAMPLE_RATE, subtype="PCM_16")
+        clips.append(wav)
+        m4a = out_dir / f"{i:02d}-{safe}.m4a"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(wav), "-c:a", "aac", "-b:a", "64k",
+                        "-ac", "1", str(m4a)], check=True)
+        log(f"voice {i:>2}  {spec:<32} {fmt(len(audio) / SAMPLE_RATE)}  -> {m4a.name}")
+    list_file = work / "all.concat.txt"
+    list_file.write_text("".join(f"file '{c.as_posix()}'\n" for c in clips))
+    everything = out_dir / "00-all-voices.m4a"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(list_file),
+                    "-c:a", "aac", "-b:a", "64k", "-ac", "1", str(everything)], check=True)
+    log(f"wrote {everything}")
+    return [everything]
+
 # ----------------------------------------------------------------------------- commands
 
 def fmt(seconds: float) -> str:
@@ -282,9 +513,12 @@ def fmt(seconds: float) -> str:
 
 def make(txt: Path, out_dir: Path, voice: str, speed: float, group: int, limit: int | None,
          title: str | None, dry_run: bool, log, chapters_range: tuple[int, int] | None = None,
-         split: list[int] | None = None, merge_tail: bool = False) -> list[Path]:
+         split: list[int] | None = None, merge_tail: bool = False,
+         lexicon_path: Path | None = None) -> list[Path]:
     txt = txt.resolve()
-    chapters = parse_chapters(txt)
+    parse_voice(voice)  # fail on a bad spec before anything slow
+    lexicon = Lexicon.find(txt, lexicon_path)
+    chapters = parse_chapters(txt, lexicon)
     if chapters_range:
         lo, hi = chapters_range
         chapters = [c for c in chapters if lo <= c.number <= hi]
@@ -302,11 +536,16 @@ def make(txt: Path, out_dir: Path, voice: str, speed: float, group: int, limit: 
     cache_dir = out_dir / ".cache"
     new = [c for c in chapters if not (cache_dir / f"{cache_key(c, voice, speed)}.wav").exists()]
     est = sum(c.words for c in new) * seconds_per_word(cache_dir)
+    if lexicon:
+        touched = sum(1 for c in chapters if lexicon.hits("\n".join([c.subtitle, *c.paragraphs])))
+        log(f"lexicon: {len(lexicon.entries)} entries from {lexicon.source}, "
+            f"used in {touched} of {len(chapters)} chapters")
     log(f"plan: {len(chapters)} chapters ({len(new)} new, {len(chapters) - len(new)} cached), "
         f"{len(groups)} file(s), est ~{fmt(est)}")
     if dry_run:
         for c in chapters:
-            log(f"  ch {c.number:>5}  {c.words:>5} words  {len(c.paragraphs):>3} paras  {c.subtitle}")
+            state = "new" if c in new else "cached"
+            log(f"  ch {c.number:>5}  {c.words:>5} words  {len(c.paragraphs):>3} paras  {state:<6}  {c.subtitle}")
         return []
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -315,7 +554,7 @@ def make(txt: Path, out_dir: Path, voice: str, speed: float, group: int, limit: 
 
     def synth_factory() -> Synth:
         if "s" not in synth_holder:
-            synth_holder["s"] = Synth(voice, speed)
+            synth_holder["s"] = Synth(voice, speed, cache_dir)
         return synth_holder["s"]
 
     outputs: list[Path] = []
@@ -354,7 +593,8 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p):
-        p.add_argument("--voice", default="af_heart", help="Kokoro voice id (default af_heart)")
+        p.add_argument("--voice", default="am_liam",
+                       help="Kokoro voice id, or a blend like am_liam:0.7,am_michael:0.3 (default am_liam)")
         p.add_argument("--speed", type=float, default=1.0)
         p.add_argument("--group", type=int, default=25, help="chapters per M4B (default 25)")
         p.add_argument("--merge-tail", action="store_true",
@@ -363,6 +603,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--title", help="book title (default derived from the filename)")
         p.add_argument("--dry-run", action="store_true", help="parse and list chapters, no audio")
         p.add_argument("--log-file", type=Path, help="append progress lines here as well as stdout")
+        p.add_argument("--lexicon", type=Path,
+                       help="pronunciation lexicon (default lexicon.json beside the text file or one folder up)")
 
     pm = sub.add_parser("make", help="one text file -> M4B files")
     pm.add_argument("txt", type=Path)
@@ -377,17 +619,53 @@ def main(argv: list[str] | None = None) -> int:
     pq.add_argument("--out-dir", type=Path, help="default <folder>/audiobooks")
     common(pq)
 
+    po = sub.add_parser("oov", help="words Kokoro has to guess (espeak fallback): lexicon candidates")
+    po.add_argument("txt", type=Path)
+    po.add_argument("--chapters", type=parse_range)
+    po.add_argument("--top", type=int, default=40)
+    po.add_argument("--lexicon", type=Path)
+
+    pc = sub.add_parser("check", help="Whisper round trip: transcribe cached chapters, diff against the text")
+    pc.add_argument("txt", type=Path)
+    pc.add_argument("--chapters", type=parse_range, required=True)
+    pc.add_argument("--out-dir", type=Path, default=Path("audiobooks"), help="where .cache/ is; reports go to check/")
+    pc.add_argument("--voice", help="only renders in this voice (default: newest render of each chapter)")
+    pc.add_argument("--model", default="mlx-community/whisper-large-v3-turbo")
+    pc.add_argument("--lexicon", type=Path)
+
+    pa = sub.add_parser("audition", help="the same passage in several voices or blends (am_liam:0.7,am_michael:0.3)")
+    pa.add_argument("voices", nargs="+")
+    pa.add_argument("--txt", type=Path, help="text file to take the passage from (with --chapter)")
+    pa.add_argument("--chapter", type=int)
+    pa.add_argument("--paragraphs", type=int, default=4)
+    pa.add_argument("--text", help="or the passage itself")
+    pa.add_argument("--out-dir", type=Path, default=Path("audiobooks/compare/auditions"))
+    pa.add_argument("--speed", type=float, default=1.0)
+    pa.add_argument("--lexicon", type=Path)
+
     a = ap.parse_args(argv)
 
     def log(line: str) -> None:
         stamp = time.strftime("%H:%M:%S")
         print(f"[{stamp}] {line}", flush=True)
-        if a.log_file:
+        if getattr(a, "log_file", None):
             with open(a.log_file, "a") as f:
                 f.write(f"[{stamp}] {line}\n")
 
+    t0 = time.time()
+    if a.cmd == "oov":
+        oov(a.txt, a.chapters, a.lexicon, a.top, log)
+        return 0
+    if a.cmd == "check":
+        check(a.txt, a.chapters, a.out_dir, a.voice, a.model, a.lexicon, log)
+        log(f"RESULT: checked in {fmt(time.time() - t0)}")
+        return 0
+    if a.cmd == "audition":
+        outs = audition(a.voices, a.txt, a.chapter, a.paragraphs, a.text, a.out_dir, a.speed, a.lexicon, log)
+        log(f"RESULT: {len(outs)} file(s) in {fmt(time.time() - t0)}")
+        return 0
     kw = dict(voice=a.voice, speed=a.speed, group=a.group, limit=a.limit, title=a.title,
-              dry_run=a.dry_run, log=log, merge_tail=a.merge_tail)
+              dry_run=a.dry_run, log=log, merge_tail=a.merge_tail, lexicon_path=a.lexicon)
     t0 = time.time()
     if a.cmd == "make":
         outs = make(a.txt, a.out_dir, chapters_range=a.chapters, split=a.split, **kw)

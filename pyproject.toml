@@ -6,9 +6,19 @@ requires-python = ">=3.12"
 dependencies = [
     "misaki[en]>=0.9.4",
     "mlx-audio>=0.5.5",
+    "mlx-whisper>=0.4.3",
     "numpy>=2.5.3",
     "soundfile>=0.14.0",
 ]
 
 [project.scripts]
 audiobook = "audiobook_maker:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
