@@ -34,7 +34,7 @@ sys.argv = [
   "--data.espeak_voice", "en-us",
   "--data.cache_dir", "train/real/cache",
   "--data.config_path", "train/real/config.json",
-  "--data.batch_size", "16",
+  "--data.batch_size", "8",
   "--ckpt_path", latest_ckpt,
   "--trainer.max_epochs", "4000",
   "--trainer.default_root_dir", "train/real/checkpoints",
