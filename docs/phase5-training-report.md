@@ -17,10 +17,15 @@
 
 ## Step 3: Real Fine-Tune
 - **Status**: Currently Running.
-- **Command**: `train/.venv/bin/python run_piper_final.py`
 - **Configuration**:
   - `max_epochs`: 4000
-  - `batch_size`: 32
-  - `checkpoint_dir`: `train/real`
-  - Resuming from `lessac-medium`
-- **Expected Completion**: Training will run overnight and log checkpoints to `train/real/checkpoints`.
+  - `batch_size`: 8 (adjusted for optimal step counting)
+  - `checkpoint_dir`: `train/real/checkpoints`
+  - Resuming from `lessac-medium` via auto-resume script
+
+### Midpoint Evaluation (Epoch 2361)
+- **Validation Score (MOS)**: 3.4975
+- **Quality Notes**:
+  - Intelligible, but exhibited noticeable robotic and "staticy" audio artifacts.
+  - Pacing felt slightly rushed and unnatural.
+- **Action**: This is highly typical of midpoint VITS training convergence. The model requires further epochs to smooth out the metallic artifacts and properly learn the human pacing of the dataset. Resumed training targeting 4000+ epochs.
