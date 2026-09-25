@@ -17,3 +17,10 @@ Generate audiobooks with `./audiobook.sh`; do not read the source to run a job.
 - Narration checks: `./audiobook.sh oov N-M` (lexicon candidates, seconds), `./audiobook.sh check N-M` (Whisper, ~15 s/chapter, refuses while a render runs; reports in `audiobooks/check/`). Lexicon: `~/Desktop/ShadowSlave/lexicon.json`. Tests: `uv run pytest`.
 - Default voice is am_liam (the user's pick); chapters 1162-1261 were rendered in af_heart on purpose.
 - Other flags pass through to `audiobook_maker.py make`: `--voice af_heart`, `--speed 1.0`, `--title`.
+
+## Key Learnings & Mac M4 Pro Training Quirks
+- **App Nap & Throttling**: macOS aggressively suspends background python processes (PyTorch Lightning) when the display sleeps. This drops training speed from 1-3 mins/epoch to 15+ mins/epoch or deadlocks entirely. **Fix**: Wrap training jobs in `caffeinate -i` (e.g., `caffeinate -i python run_piper_final.py`).
+- **Piper Fine-Tuning Convergence**: When fine-tuning a 30-minute high-quality voice dataset over a base model (like `lessac-medium`), Epochs 2000-2500 often produce a highly intelligible but "robotic/staticy" voice with rushed pacing. This is the midpoint. True human-like inflection and noise-reduction convergence typically requires 4000-5000+ epochs.
+- **Validation Metric**: Piper uses an automatic MOS (Mean Opinion Score) predictor (`val_mos`). A score in the mid-3s (e.g., 3.2 - 3.5) is extremely high for this strict predictor.
+- **Auto-Resume**: PyTorch Lightning training is natively resumable. Using a script to regex the highest epoch out of `train/real/checkpoints/lightning_logs/*/checkpoints/*.ckpt` allows for seamless start/stop.
+- **Aliases**: We created project-specific terminal shortcuts (`train` and `progress`) inside `~/.zshrc` that map to `audiobook.sh train` and `audiobook.sh progress`.
