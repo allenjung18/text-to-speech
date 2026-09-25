@@ -116,5 +116,12 @@ oov|check)
 record)
     cd "$REPO" && exec uv run python record.py "$@"
     ;;
-*) die "unknown command '$cmd' (start | status | wait | tail | oov | check | record)" ;;
+train)
+    cd "$REPO" && exec caffeinate -i train/.venv/bin/python run_piper_final.py "$@"
+    ;;
+progress)
+    cd "$REPO" && echo "Starting TensorBoard... open http://localhost:6006 in your browser!"
+    exec train/.venv/bin/tensorboard --logdir train/real/checkpoints/lightning_logs "$@"
+    ;;
+*) die "unknown command '$cmd' (start | status | wait | tail | oov | check | record | train | progress)" ;;
 esac
