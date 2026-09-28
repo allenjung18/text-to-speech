@@ -17,6 +17,13 @@ Generate audiobooks with `./audiobook.sh`; do not read the source to run a job.
 - Narration checks: `./audiobook.sh oov N-M` (lexicon candidates, seconds), `./audiobook.sh check N-M` (Whisper, ~15 s/chapter, refuses while a render runs; reports in `audiobooks/check/`). Lexicon: `~/Desktop/ShadowSlave/lexicon.json`. Tests: `uv run pytest`.
 - Default voice is am_liam (the user's pick); chapters 1162-1261 were rendered in af_heart on purpose.
 - Other flags pass through to `audiobook_maker.py make`: `--voice af_heart`, `--speed 1.0`, `--title`.
+- A range may cross archived files (1320-1419 reads two); `--group 1000` makes it one M4B.
+- Google Cloud TTS: a voice like `en-US-Chirp3-HD-Algenib` (the user's pick since 2026-09-27) switches engine.
+  Python cannot read the Keychain here, so pass the key in:
+  `GOOGLE_TTS_API_KEY=$(security find-generic-password -a "$USER" -s google-tts-api-key -w) ./audiobook.sh start 1462-1561 --voice en-US-Chirp3-HD-Algenib --group 1000`.
+  Free tier is 1M chars per calendar month for Chirp 3 HD; `~/.cache/audiobook-maker/google-usage.json` counts
+  what was sent and a run keeps only the chapters that fit (`--dry-run` shows the `budget:` line). lexicon.json is
+  not applied (it holds Kokoro phonemes). Auditions: `compare/google/audition.py`.
 
 ## Key Learnings & Mac M4 Pro Training Quirks
 - **App Nap & Throttling**: macOS aggressively suspends background python processes (PyTorch Lightning) when the display sleeps. This drops training speed from 1-3 mins/epoch to 15+ mins/epoch or deadlocks entirely. **Fix**: Wrap training jobs in `caffeinate -i` (e.g., `caffeinate -i python run_piper_final.py`).

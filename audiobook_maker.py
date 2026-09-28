@@ -176,13 +176,150 @@ class Synth:
         return np.concatenate(parts)
 
 
+# ----------------------------------------------------------------------------- google cloud tts
+
+GOOGLE_MODEL_ID = "google-cloud-tts-v1"
+GOOGLE_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
+GOOGLE_MAX_BYTES = 4500  # the API caps a request at 5,000 bytes of input
+GOOGLE_FREE_CHARS = 1_000_000  # Chirp 3 HD free tier per calendar month (Standard/WaveNet: 4M)
+GOOGLE_USAGE = Path.home() / ".cache" / "audiobook-maker" / "google-usage.json"
+
+
+def is_google_voice(voice: str) -> bool:
+    return bool(re.fullmatch(r"[a-z]{2}-[A-Z]{2}-[A-Za-z0-9]+-.+", voice))
+
+
+def google_tier(voice: str) -> str:
+    """en-US-Chirp3-HD-Algenib -> Chirp3-HD; en-US-Wavenet-D -> Wavenet. Each tier has its own allowance."""
+    return voice.split("-", 2)[2].rsplit("-", 1)[0]
+
+
+class GoogleUsage:
+    """Characters sent to Google per calendar month and voice tier, in a small JSON ledger.
+    Billing is per character of input, so this is what the free tier counts too (failed requests
+    are not billed and are not recorded)."""
+
+    def __init__(self, voice: str, path: Path = GOOGLE_USAGE):
+        import threading
+        self.path, self.tier = path, google_tier(voice)
+        self.month = time.strftime("%Y-%m")
+        self._lock = threading.Lock()
+
+    def _load(self) -> dict:
+        return json.loads(self.path.read_text()) if self.path.exists() else {}
+
+    def used(self) -> int:
+        return self._load().get(self.month, {}).get(self.tier, 0)
+
+    def add(self, chars: int) -> None:
+        with self._lock:
+            data = self._load()
+            month = data.setdefault(self.month, {})
+            month[self.tier] = month.get(self.tier, 0) + chars
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=1))
+            tmp.replace(self.path)
+
+
+def split_for_request(text: str, limit: int = GOOGLE_MAX_BYTES) -> list[str]:
+    """A paragraph longer than one request allows, cut at sentence ends (spaces as a last resort)."""
+    size = lambda s: len(s.encode("utf-8"))
+    if size(text) <= limit:
+        return [text]
+    out, cur = [], ""
+    for piece in re.split(r"(?<=[.!?…])\s+", text):
+        while size(piece) > limit:  # one monster sentence: cut on a space
+            cut = piece.rfind(" ", 0, limit // 4)
+            cut = cut if cut > 0 else limit // 4
+            out.append(piece[:cut])
+            piece = piece[cut:].lstrip()
+        if cur and size(f"{cur} {piece}") > limit:
+            out.append(cur)
+            cur = piece
+        else:
+            cur = f"{cur} {piece}".strip()
+    return out + ([cur] if cur else [])
+
+
+def chapter_chars(ch: Chapter) -> int:
+    return len(ch.spoken_title) + sum(len(p) for p in ch.spoken_paragraphs)
+
+
+class GoogleSynth:
+    """Same shape as Synth, but each paragraph is a Google Cloud TTS request. Paragraphs go out in
+    parallel and come back in order; transient errors (429, 5xx, network) retry with backoff."""
+
+    def __init__(self, voice: str, speed: float, usage: GoogleUsage, workers: int = 8):
+        import os
+        self.key = os.environ.get("GOOGLE_TTS_API_KEY", "")
+        if not self.key:
+            raise SystemExit("GOOGLE_TTS_API_KEY is empty. Python cannot read the Keychain here, so pass it in:\n"
+                             '  GOOGLE_TTS_API_KEY=$(security find-generic-password -a "$USER" -s google-tts-api-key -w) ...')
+        self.voice, self.speed, self.usage, self.workers = voice, speed, usage, workers
+        self.lang = "-".join(voice.split("-")[:2])
+
+    def _request(self, text: str) -> np.ndarray:
+        import base64
+        import io
+        import urllib.error
+        import urllib.request
+        body = {"input": {"text": text}, "voice": {"languageCode": self.lang, "name": self.voice},
+                "audioConfig": {"audioEncoding": "LINEAR16", "sampleRateHertz": SAMPLE_RATE,
+                                "speakingRate": self.speed}}
+        req = urllib.request.Request(GOOGLE_URL, data=json.dumps(body).encode(),
+                                     headers={"X-Goog-Api-Key": self.key, "Content-Type": "application/json"})
+        for attempt in range(7):
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    wav = base64.b64decode(json.load(resp)["audioContent"])
+                break
+            except urllib.error.HTTPError as e:
+                if e.code not in (429, 500, 502, 503, 504) or attempt == 6:
+                    msg = e.read().decode(errors="replace")[:500]
+                    raise SystemExit(f"Google TTS HTTP {e.code} on a {len(text)}-char request: {msg}")
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
+                if attempt == 6:
+                    raise
+            time.sleep(2 ** attempt)
+        self.usage.add(len(text))
+        audio, sr = sf.read(io.BytesIO(wav), dtype="float32")
+        if sr != SAMPLE_RATE:
+            raise SystemExit(f"Google returned {sr} Hz audio, expected {SAMPLE_RATE}")
+        return audio.reshape(-1)
+
+    def say(self, text: str) -> np.ndarray:
+        parts: list[np.ndarray] = []
+        for t in split_for_request(text):
+            if parts:
+                parts.append(silence(PAUSE_WITHIN_PARAGRAPH))
+            parts.append(self._request(t))
+        return np.concatenate(parts)
+
+    def chapter(self, ch: Chapter) -> np.ndarray:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(self.workers) as pool:
+            title, *paras = pool.map(self.say, [ch.spoken_title, *ch.spoken_paragraphs])
+        parts = [title, silence(PAUSE_AFTER_TITLE)]
+        for i, p in enumerate(paras):
+            if i:
+                parts.append(silence(PAUSE_BETWEEN_PARAGRAPHS))
+            parts.append(p)
+        parts.append(silence(PAUSE_END_OF_CHAPTER))
+        return np.concatenate(parts)
+
+
 def silence(seconds: float) -> np.ndarray:
     return np.zeros(int(seconds * SAMPLE_RATE), dtype=np.float32)
 
 
+def model_for(voice: str) -> str:
+    return GOOGLE_MODEL_ID if is_google_voice(voice) else MODEL_ID
+
+
 def cache_key(ch: Chapter, voice: str, speed: float) -> str:
     h = hashlib.sha1()
-    h.update(f"{MODEL_ID}|{voice}|{speed}|{PIPELINE_VERSION}|".encode())
+    h.update(f"{model_for(voice)}|{voice}|{speed}|{PIPELINE_VERSION}|".encode())
     h.update(ch.cache_text().encode("utf-8"))
     return h.hexdigest()
 
@@ -207,7 +344,7 @@ def ensure_chapter_audio(ch: Chapter, cache_dir: Path, synth_factory, voice: str
     meta.write_text(json.dumps({
         "number": ch.number, "subtitle": ch.subtitle, "words": ch.words,
         "duration": duration, "generate_seconds": gen, "voice": voice, "speed": speed,
-        "model": MODEL_ID, "pipeline_version": PIPELINE_VERSION,
+        "model": model_for(voice), "pipeline_version": PIPELINE_VERSION,
     }, indent=1))
     log(f"ch {ch.number:>5}  {ch.words:>5} words  {fmt(duration)} audio  {gen:6.1f}s gen  {duration / gen:5.1f}x realtime")
     return wav
@@ -496,7 +633,7 @@ def audition(voices: list[str], txt: Path | None, chapter: int | None, paragraph
                         "-ac", "1", str(m4a)], check=True)
         log(f"voice {i:>2}  {spec:<32} {fmt(len(audio) / SAMPLE_RATE)}  -> {m4a.name}")
     list_file = work / "all.concat.txt"
-    list_file.write_text("".join(f"file '{c.as_posix()}'\n" for c in clips))
+    list_file.write_text("".join(f"file '{c.resolve().as_posix()}'\n" for c in clips))
     everything = out_dir / "00-all-voices.m4a"
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(list_file),
                     "-c:a", "aac", "-b:a", "64k", "-ac", "1", str(everything)], check=True)
@@ -511,22 +648,50 @@ def fmt(seconds: float) -> str:
     return f"{h}h{m:02d}m{sec:02d}s" if h else f"{m}m{sec:02d}s"
 
 
-def make(txt: Path, out_dir: Path, voice: str, speed: float, group: int, limit: int | None,
+def make(txt: Path | list[Path], out_dir: Path, voice: str, speed: float, group: int, limit: int | None,
          title: str | None, dry_run: bool, log, chapters_range: tuple[int, int] | None = None,
          split: list[int] | None = None, merge_tail: bool = False,
          lexicon_path: Path | None = None) -> list[Path]:
-    txt = txt.resolve()
-    parse_voice(voice)  # fail on a bad spec before anything slow
-    lexicon = Lexicon.find(txt, lexicon_path)
-    chapters = parse_chapters(txt, lexicon)
+    txts = [t.resolve() for t in (txt if isinstance(txt, list) else [txt])]  # several = one range across files
+    txt = txts[0]
+    google = is_google_voice(voice)
+    if google:
+        lexicon = Lexicon()  # lexicon.json holds Kokoro (misaki) phonemes; Google would read them out
+        log(f"engine: Google Cloud TTS, voice {voice} (lexicon not applied)")
+    else:
+        parse_voice(voice)  # fail on a bad spec before anything slow
+        lexicon = Lexicon.find(txt, lexicon_path)
+    chapters = [c for t in txts for c in parse_chapters(t, lexicon)]
     if chapters_range:
         lo, hi = chapters_range
         chapters = [c for c in chapters if lo <= c.number <= hi]
         missing = sorted(set(range(lo, hi + 1)) - {c.number for c in chapters})
         if missing:
-            raise SystemExit(f"{txt.name} has no chapter(s) {missing[:10]} in {lo}-{hi}")
+            raise SystemExit(f"{', '.join(t.name for t in txts)} has no chapter(s) {missing[:10]} in {lo}-{hi}")
     if limit:
         chapters = chapters[:limit]
+    usage = None
+    if google:
+        # Stop before the monthly free allowance runs out: keep the longest prefix of the range
+        # whose uncached chapters fit in what is left this month.
+        usage = GoogleUsage(voice)
+        left = GOOGLE_FREE_CHARS - usage.used()
+        need, keep = 0, []
+        for c in chapters:
+            cached = (out_dir / ".cache" / f"{cache_key(c, voice, speed)}.wav").exists()
+            cost = 0 if cached else chapter_chars(c)
+            if need + cost > left:
+                break
+            need += cost
+            keep.append(c)
+        log(f"budget: {usage.tier} {usage.used():,} of {GOOGLE_FREE_CHARS:,} chars used in {usage.month}; "
+            f"this run sends {need:,}, leaving {left - need:,}")
+        if len(keep) < len(chapters):
+            log(f"budget: stopping after ch {keep[-1].number if keep else '-'} — "
+                f"{len(chapters) - len(keep)} chapter(s) would pass the free allowance")
+        if not keep:
+            raise SystemExit("budget: not even one chapter fits in this month's free allowance")
+        chapters = keep
     book = title or book_title_from(txt)
     total_words = sum(c.words for c in chapters)
     groups = group_chapters(chapters, group, split, merge_tail)
@@ -550,11 +715,11 @@ def make(txt: Path, out_dir: Path, voice: str, speed: float, group: int, limit: 
 
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(exist_ok=True)
-    synth_holder: dict[str, Synth] = {}
+    synth_holder: dict[str, Synth | GoogleSynth] = {}
 
-    def synth_factory() -> Synth:
+    def synth_factory() -> Synth | GoogleSynth:
         if "s" not in synth_holder:
-            synth_holder["s"] = Synth(voice, speed, cache_dir)
+            synth_holder["s"] = GoogleSynth(voice, speed, usage) if google else Synth(voice, speed, cache_dir)
         return synth_holder["s"]
 
     outputs: list[Path] = []
@@ -594,7 +759,8 @@ def main(argv: list[str] | None = None) -> int:
 
     def common(p):
         p.add_argument("--voice", default="am_liam",
-                       help="Kokoro voice id, or a blend like am_liam:0.7,am_michael:0.3 (default am_liam)")
+                       help="Kokoro voice id, or a blend like am_liam:0.7,am_michael:0.3 (default am_liam), "
+                            "or a Google Cloud voice like en-US-Chirp3-HD-Algenib (needs GOOGLE_TTS_API_KEY)")
         p.add_argument("--speed", type=float, default=1.0)
         p.add_argument("--group", type=int, default=25, help="chapters per M4B (default 25)")
         p.add_argument("--merge-tail", action="store_true",
@@ -607,7 +773,7 @@ def main(argv: list[str] | None = None) -> int:
                        help="pronunciation lexicon (default lexicon.json beside the text file or one folder up)")
 
     pm = sub.add_parser("make", help="one text file -> M4B files")
-    pm.add_argument("txt", type=Path)
+    pm.add_argument("txt", type=Path, nargs="+", help="one text file, or consecutive ones for a range across them")
     pm.add_argument("--out-dir", type=Path, default=Path("audiobooks"))
     pm.add_argument("--chapters", type=parse_range, help="only chapters N-M (inclusive)")
     pm.add_argument("--split", type=parse_split, help="explicit chapters per file, e.g. 10,10,10,10,12")

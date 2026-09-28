@@ -41,6 +41,20 @@ find_txt() {  # the archived file whose chapter span covers lo..hi
     return 1
 }
 
+find_txts() {  # consecutive archived files that together cover lo..hi, one per line
+    local lo=$1 hi=$2 f a b next=$1 out=()
+    while IFS= read -r f; do
+        a=$(basename "$f" .txt | sed -E 's/.*_chapters_([0-9]+)_([0-9]+)$/\1/')
+        b=$(basename "$f" .txt | sed -E 's/.*_chapters_([0-9]+)_([0-9]+)$/\2/')
+        if [ "$a" -le "$next" ] && [ "$b" -ge "$next" ]; then
+            out+=("$f"); next=$((b + 1))
+            [ "$next" -gt "$hi" ] && { printf '%s\n' "${out[@]}"; return 0; }
+        fi
+    done < <(ls "$SS"/archived/*_chapters_*_*.txt 2>/dev/null |
+             awk -F_ '{n=$(NF-1); print n "\t" $0}' | sort -n | cut -f2-)
+    return 1
+}
+
 status_line() {
     if [ ! -f "$LOG" ]; then echo "IDLE: no job has run"; return 0; fi
     local plan total new files done_ch done_new wrote now started elapsed eta rc
@@ -76,7 +90,9 @@ start)
     [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]] || die "range must look like 1210-1261, got '$range'"
     lo=${BASH_REMATCH[1]} hi=${BASH_REMATCH[2]}
     running && die "a job is already running (pid $(cat "$PIDF")): $(status_line)"
-    txt=$(find_txt "$lo" "$hi") || die "no file in $SS/archived covers $lo-$hi (ranges cannot span two files)"
+    txts=()
+    while IFS= read -r f; do txts+=("$f"); done < <(find_txts "$lo" "$hi")
+    [ ${#txts[@]} -gt 0 ] || die "no consecutive files in $SS/archived cover $lo-$hi"
     mkdir -p "$STATE"; rm -f "$EXITF"; : > "$LOG"; date +%s > "$STARTF"
     # The job shell: run make, record its exit code, notify. Detached with a new session so the
     # caller's shell (or a Claude tool call) ending cannot take it down; macOS has no setsid.
@@ -84,7 +100,7 @@ start)
          msg=$(grep "RESULT:" "$2" | tail -1 | sed -E "s/^\[[0-9:]+\] //"); [ $rc = 0 ] || msg="FAILED (exit $rc)"
          osascript -e "display notification \"$4: $msg\" with title \"Audiobook\"" >/dev/null 2>&1 || true'
     python3 - "$PIDF" /bin/bash -c "$job" job "$REPO" "$LOG" "$EXITF" "Ch $lo-$hi" \
-        "$txt" --out-dir "$SS/audiobooks" --chapters "$lo-$hi" "$@" <<'EOF'
+        "${txts[@]}" --out-dir "$SS/audiobooks" --chapters "$lo-$hi" "$@" <<'EOF'
 import subprocess, sys
 p = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
